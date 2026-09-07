@@ -156,11 +156,18 @@ Attention/GDN 0.087 秒、Hyper-Connection 0.053 秒、输出头 0.010 秒。
 ./scripts/benchmark-qwen4.sh
 ```
 
+这是固定的 2,048 上下文、16-token 测试。脚本会拒绝额外命令行参数，避免参数
+被静默忽略或改变测试口径；线程、模型和内存路径分别使用 `QWEN4_THREADS`、
+`QWEN4_MODEL` 和 `QWEN4_MEMORY_GIB` 环境变量。
+
 运行带正确性检查的 batch 吞吐基准：
 
 ```bash
 ./scripts/benchmark-qwen4-batch.sh
 ```
+
+该验证使用固定的 256-token 容量和 4 个位置，同样会拒绝额外命令行参数；需要
+调整时使用上述环境变量。
 
 欢迎把其他 CPU 的实测结果发到
 [社区 benchmark 汇总](https://github.com/shyringo/qwen3.8-flash-next-in-c/discussions/1)。

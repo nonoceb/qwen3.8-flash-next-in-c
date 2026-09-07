@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if (( $# )); then
+  echo "qwen4 benchmark: this script uses a fixed 2,048-context, 16-token workload and accepts no arguments" >&2
+  echo "qwen4 benchmark: use QWEN4_THREADS, QWEN4_MODEL or QWEN4_MEMORY_GIB; use scripts/chat-qwen4.sh for custom generation" >&2
+  exit 2
+fi
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 MODEL=${QWEN4_MODEL:-$($SCRIPT_DIR/get-qwen4-model.sh)}
@@ -10,9 +16,13 @@ port=${QWEN4_BENCH_PORT:-18080}
 export OMP_NUM_THREADS=$jobs
 export OMP_DYNAMIC=false
 export OMP_WAIT_POLICY=ACTIVE
+memory_args=()
+if [[ -n ${QWEN4_MEMORY_GIB:-} ]]; then
+  memory_args=(--memory-gib "$QWEN4_MEMORY_GIB")
+fi
 make -s -C "$ROOT" -j"$jobs" bin/qwen4
 "$ROOT/bin/qwen4" --model "$MODEL" --server "$port" --context 2048 \
-  --max-tokens 16 --no-thinking &
+  --max-tokens 16 --no-thinking "${memory_args[@]}" &
 server_pid=$!
 cleanup() {
   kill "$server_pid" 2>/dev/null || true

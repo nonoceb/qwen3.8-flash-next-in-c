@@ -170,11 +170,18 @@ Run the fixed reproducible workload:
 ./scripts/benchmark-qwen4.sh
 ```
 
+This is a fixed 2,048-context, 16-token workload. It rejects command-line
+arguments instead of silently changing or ignoring the benchmark; set
+`QWEN4_THREADS`, `QWEN4_MODEL` or `QWEN4_MEMORY_GIB` in the environment.
+
 Run the correctness-gated batch throughput benchmark:
 
 ```bash
 ./scripts/benchmark-qwen4-batch.sh
 ```
+
+This verifier uses a fixed 256-token capacity and four positions. It also
+rejects command-line arguments; use the same environment variables above.
 
 Share results from another CPU in the
 [community benchmark thread](https://github.com/shyringo/qwen3.8-flash-next-in-c/discussions/1).
