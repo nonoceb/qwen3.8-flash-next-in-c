@@ -1,7 +1,7 @@
 <h1 align="center">Qwen3.8-Flash-Next in C：200B 以下最强模型，笔记本 CPU 接近 10 token/s</h1>
 
 <p align="center">
-  <strong>单颗笔记本 CPU 运行 200B 以下最强模型，精确 batch 验证吞吐接近 10 token/s。</strong><br>
+  <strong>单颗笔记本 CPU 运行 200B 以下最强模型：最低 8 GB 内存可运行，32 GB 参考笔记本上的最优精确 batch 吞吐接近 10 token/s。</strong><br>
   原生 C 语言运行 125B-A6B + 51B PLE：无需 GPU、CUDA、Python、PyTorch、权重转换或其他推理框架。<br>
   可以直接在终端聊天，也可以通过常驻的 OpenAI 兼容接口接入应用。
 </p>

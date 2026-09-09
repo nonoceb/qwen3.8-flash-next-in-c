@@ -1,7 +1,7 @@
 <h1 align="center">Qwen3.8-Flash-Next in C: The Best Model Under 200B, Near 10 token/s on a Laptop CPU</h1>
 
 <p align="center">
-  <strong>Run the best model under 200B near 10 token/s on a single laptop CPU, with exact batch verification.</strong><br>
+  <strong>Run the best model under 200B on a single laptop CPU: an 8 GB RAM minimum path and best exact batch throughput near 10 token/s on the reference 32 GB laptop.</strong><br>
   Run the 125B-A6B + 51B PLE model in native C: no GPU, CUDA, Python, PyTorch, model conversion, or external inference runtime.<br>
   Chat in the terminal or connect your apps through a resident OpenAI-compatible API.
 </p>
