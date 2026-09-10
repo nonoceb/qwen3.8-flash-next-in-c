@@ -5,8 +5,10 @@
 #include "qwen38_quant.h"
 
 #include <math.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #if defined(__GNUC__)
@@ -2972,12 +2974,87 @@ int q38_tensor_gemv_f32(float *output, const float *input,
                         const Q38GGUFTensor *tensor)
 {
     if (!output || !input || !tensor || tensor->n_dims != 2) return 0;
+    
+    // Try Vulkan GPU acceleration first (if enabled)
+#ifdef VULKAN_SUPPORT
+    extern int q38_vulkan_gemv_f32(void*, void*, float*, const float*, const void*);
+    extern int q38_vulkan_gemv_iq4nl(void*, void*, float*, const float*, const void*);
+    extern int q38_vulkan_gemv_q3_k(void*, void*, float*, const float*, const void*);
+    extern void* q38_vulkan_get_context(void);
+    extern void* q38_vulkan_get_gemv(void);
+    
+    // Get context triggers lazy initialization
+    void *ctx = q38_vulkan_get_context();
+    void *gemv = q38_vulkan_get_gemv();
+    
+    if (ctx && gemv) {
+        int gpu_result = 0;
+        
+        // Handle different quantization types
+        if (tensor->type == Q38_GGML_F32) {
+            gpu_result = q38_vulkan_gemv_f32(ctx, gemv, output, input, tensor);
+        }
+        else if (tensor->type == Q38_GGML_Q3_K) {
+            gpu_result = q38_vulkan_gemv_q3_k(ctx, gemv, output, input, tensor);
+        }
+        // TODO: IQ4_NL Vulkan path disabled due to GPU page faults - needs debugging
+        // else if (tensor->type == Q38_GGML_IQ4_NL) {
+        //     gpu_result = q38_vulkan_gemv_iq4nl(ctx, gemv, output, input, tensor);
+        // }
+        
+        if (gpu_result) {
+            return 1;  // Success on GPU
+        }
+        // Fall through to CPU on GPU failure
+    }
+#endif
+    
     const uint64_t width = tensor->shape[0];
     const uint64_t rows = tensor->shape[1];
     const uint32_t block_elements = q38_ggml_block_elements(tensor->type);
     const uint32_t block_bytes = q38_ggml_block_bytes(tensor->type);
     if (!block_elements || !block_bytes || width % block_elements != 0) return 0;
     const uint64_t row_bytes = width / block_elements * block_bytes;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    // AVX-512 optimized path for F32 (16 rows at a time)
+    if (tensor->type == Q38_GGML_F32 && rows >= 16u &&
+        !getenv("Q38_DISABLE_F32_AVX512")) {
+        const uint64_t groups = rows / 16u;
+        
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(groups >= 4u)
+#endif
+        for (uint64_t group = 0; group < groups; ++group) {
+            const uint64_t row0 = group * 16u;
+            __m512 sums = _mm512_setzero_ps();
+            const float *row[16];
+            for (uint32_t lane = 0; lane < 16u; ++lane)
+                row[lane] = (const float *)(tensor->data +
+                                            (row0 + lane) * row_bytes);
+            
+            for (uint64_t column = 0; column < width; ++column) {
+                // Load 16 weights from different rows at same column
+                __m512 weights = _mm512_set_ps(
+                    row[15][column], row[14][column], row[13][column],
+                    row[12][column], row[11][column], row[10][column],
+                    row[9][column], row[8][column],
+                    row[7][column], row[6][column], row[5][column],
+                    row[4][column], row[3][column], row[2][column],
+                    row[1][column], row[0][column]);
+                
+                sums = _mm512_fmadd_ps(weights,
+                                       _mm512_set1_ps(input[column]), sums);
+            }
+            _mm512_storeu_ps(output + row0, sums);
+        }
+        
+        for (uint64_t row = groups * 16u; row < rows; ++row)
+            output[row] = q38_dot_row(tensor->data + row * row_bytes,
+                                      input, width, tensor->type);
+        return 1;
+    }
+#endif
 
 #if defined(__AVX2__) && defined(__FMA__)
     if (tensor->type == Q38_GGML_F32 && rows >= 8u &&
@@ -3028,6 +3105,12 @@ int q38_tensor_gemv_f32(float *output, const float *input,
                                       input, width, tensor->type);
         return 1;
     }
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    // AVX-512 optimized path for IQ4_NL (16 rows at a time)
+    // DISABLED due to correctness issues - falls back to AVX2 path
+    // TODO: Fix shuffle logic for proper 16-row processing
+#endif
 
     if (tensor->type == Q38_GGML_IQ4_NL && rows >= 8u &&
         !getenv("Q38_DISABLE_IQ4NL_ROW8")) {
@@ -3092,6 +3175,70 @@ int q38_tensor_gemv_f32(float *output, const float *input,
                                       input, width, tensor->type);
         return 1;
     }
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    // AVX-512 optimized path for Q8_0 (16 rows at a time)
+    if (tensor->type == Q38_GGML_Q8_0 && rows >= 16u &&
+        !getenv("Q38_DISABLE_Q80_AVX512")) {
+        const uint64_t groups = rows / 16u;
+        
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(groups >= 2u)
+#endif
+        for (uint64_t group = 0; group < groups; ++group) {
+            const uint64_t row0 = group * 16u;
+            __m512 sums = _mm512_setzero_ps();
+            
+            for (uint64_t base = 0; base < width; base += 32u) {
+                const uint64_t block = base / 32u;
+                const uint8_t *r[16];
+                for (uint32_t lane = 0; lane < 16u; ++lane)
+                    r[lane] = tensor->data + (row0 + lane) * row_bytes + block * 34u;
+                
+                // Load 16 fp16 scales and convert to float
+                __m256i scales_i16 = _mm256_set_epi16(
+                    (short)q38_load_u16(r[15]), (short)q38_load_u16(r[14]),
+                    (short)q38_load_u16(r[13]), (short)q38_load_u16(r[12]),
+                    (short)q38_load_u16(r[11]), (short)q38_load_u16(r[10]),
+                    (short)q38_load_u16(r[9]), (short)q38_load_u16(r[8]),
+                    (short)q38_load_u16(r[7]), (short)q38_load_u16(r[6]),
+                    (short)q38_load_u16(r[5]), (short)q38_load_u16(r[4]),
+                    (short)q38_load_u16(r[3]), (short)q38_load_u16(r[2]),
+                    (short)q38_load_u16(r[1]), (short)q38_load_u16(r[0]));
+                __m512 scales = _mm512_cvtph_ps(scales_i16);
+                
+                // Process 32 int8 weights per block
+                for (uint32_t i = 0; i < 32u; ++i) {
+                    // Load 16 int8 values from different rows at same column
+                    __m128i packed = _mm_set_epi8(
+                        (char)r[15][2u + i], (char)r[14][2u + i],
+                        (char)r[13][2u + i], (char)r[12][2u + i],
+                        (char)r[11][2u + i], (char)r[10][2u + i],
+                        (char)r[9][2u + i], (char)r[8][2u + i],
+                        (char)r[7][2u + i], (char)r[6][2u + i],
+                        (char)r[5][2u + i], (char)r[4][2u + i],
+                        (char)r[3][2u + i], (char)r[2][2u + i],
+                        (char)r[1][2u + i], (char)r[0][2u + i]);
+                    
+                    // Convert int8 to int32 to float
+                    __m512i quants_i32 = _mm512_cvtepi8_epi32(packed);
+                    __m512 quants = _mm512_cvtepi32_ps(quants_i32);
+                    
+                    __m512 weighted = _mm512_mul_ps(scales, quants);
+                    sums = _mm512_fmadd_ps(weighted,
+                        _mm512_set1_ps(input[base + i]),
+                        sums);
+                }
+            }
+            _mm512_storeu_ps(output + row0, sums);
+        }
+        
+        for (uint64_t row = groups * 16u; row < rows; ++row)
+            output[row] = q38_dot_row(tensor->data + row * row_bytes,
+                                      input, width, tensor->type);
+        return 1;
+    }
+#endif
 
     if (tensor->type == Q38_GGML_Q8_0 && rows >= 8u) {
         const uint64_t groups = rows / 8u;

@@ -1,0 +1,185 @@
+#version 450
+
+// Q3_K GEMV Kernel for AMD 780M iGPU (RDNA3, UMA)
+// Each block processes one row of the weight matrix
+// Q3_K format: 110 bytes per 256 elements
+//   - Bytes 0-31: high bits (1 bit per element, determines sign adjustment)
+//   - Bytes 32-95: low bits (2 bits per element, packed as 4x 2-bit fields)
+//   - Bytes 96-107: scales (16 int8_t values, packed)
+//   - Bytes 108-109: global scale (fp16)
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) buffer InputBuffer {
+    float input_vec[];
+};
+
+layout(binding = 1) buffer WeightBuffer {
+    uint weights_packed[];  // Padded to 4-byte alignment
+};
+
+layout(binding = 2) buffer OutputBuffer {
+    float output_vec[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint M;          // Number of rows
+    uint N;          // Number of columns (may not be multiple of 256)
+    uint pad0;
+    uint pad1;
+} pc;
+
+// FP16 decoder
+float decode_fp16(uint h) {
+    uint sign = (h >> 15) & 1u;
+    uint exp = (h >> 10) & 0x1Fu;
+    uint mant = h & 0x3FFu;
+    
+    if (exp == 0u) {
+        if (mant == 0u) return sign != 0u ? -0.0 : 0.0;
+        // Denormalized
+        return (sign != 0u ? -1.0 : 1.0) * pow(2.0, -14.0) * (mant / 1024.0);
+    } else if (exp == 31u) {
+        return sign != 0u ? -1.0/0.0 : 1.0/0.0;  // Inf
+    }
+    
+    return (sign != 0u ? -1.0 : 1.0) * pow(2.0, float(exp) - 15.0) * (1.0 + mant / 1024.0);
+}
+
+// Unpack Q3_K scales from packed format
+void unpack_scales(const uint packed[3], out int scales[16]) {
+    // Scales are packed in bytes 96-107 (12 bytes)
+    // First 8 bytes: low nibbles and high nibbles
+    // Next 4 bytes: high 2-bit fields
+    
+    // Extract from first 8 bytes (indices 0-7)
+    for (int i = 0; i < 8; i++) {
+        uint byte_val = (packed[0] >> (i * 4)) & 0xFu;
+        scales[i] = int(byte_val) - 32;
+    }
+    
+    // Extract from next 8 bytes (indices 8-15, stored in high nibbles)
+    for (int i = 0; i < 8; i++) {
+        uint byte_val = (packed[1] >> (i * 4)) & 0xFu;
+        scales[i + 8] = int(byte_val) - 32;
+    }
+    
+    // Apply high 2-bit fields from last 4 bytes
+    for (int i = 0; i < 16; i++) {
+        uint high_bits = (packed[2] >> ((i % 4) * 2 + (i / 4) * 8)) & 0x3u;
+        scales[i] = scales[i] | (int(high_bits) << 4);
+    }
+}
+
+shared float shared_sum[64];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    
+    if (row >= pc.M) return;
+    
+    // Calculate number of blocks (with ceiling division for partial blocks)
+    const uint blocks_per_row = (pc.N + 255u) / 256u;
+    const uint BLOCK_SIZE = 110u;  // Q3_K block size
+    const uint UINTS_PER_BLOCK = 28u;  // 110 bytes / 4 = 27.5, round up to 28
+    
+    float local_sum = 0.0;
+    
+    // Each thread processes multiple blocks
+    for (uint block_idx = tid; block_idx < blocks_per_row; block_idx += 64u) {
+        const uint block_offset = row * blocks_per_row * UINTS_PER_BLOCK + block_idx * UINTS_PER_BLOCK;
+        const uint base_elem = block_idx * 256u;
+        
+        // Load block data (padded to 28 uints)
+        uint block_data[28];
+        for (uint i = 0; i < 28u; i++) {
+            block_data[i] = weights_packed[block_offset + i];
+        }
+        
+        // Extract components
+        // High bits: bytes 0-31 (8 uints)
+        uint high_bits[8];
+        for (uint i = 0; i < 8u; i++) {
+            high_bits[i] = block_data[i];
+        }
+        
+        // Low bits: bytes 32-95 (16 uints)
+        uint low_bits[16];
+        for (uint i = 0; i < 16u; i++) {
+            low_bits[i] = block_data[8u + i];
+        }
+        
+        // Scales: bytes 96-107 (3 uints = 12 bytes)
+        uint scale_data[3];
+        for (uint i = 0; i < 3u; i++) {
+            scale_data[i] = block_data[24u + i];
+        }
+        
+        // Global scale: bytes 108-109 (1 uint, fp16 in lower 16 bits)
+        float d = decode_fp16(block_data[27u] & 0xFFFFu);
+        
+        // Unpack scales
+        int scales[16];
+        unpack_scales(scale_data, scales);
+        
+        // Process all 256 elements in this block
+        // Structure: 2 halves × 4 fields × 32 lanes = 256 elements
+        for (uint h = 0u; h < 2u; h++) {
+            for (uint field = 0u; field < 4u; field++) {
+                const uint group = h * 4u + field;
+                const uint shift = field * 2u;
+                const uint high_bit_mask = 1u << group;
+                
+                for (uint lane = 0u; lane < 32u; lane++) {
+                    // Compute element index
+                    const uint elem_idx = base_elem + h * 128u + field * 32u + lane;
+                    
+                    // BOUNDS CHECK: Skip if beyond actual dimension
+                    if (elem_idx >= pc.N) continue;
+                    
+                    // Get packed byte from low bits
+                    const uint byte_idx = h * 32u + lane;
+                    const uint uint_idx = byte_idx / 4u;
+                    const uint byte_offset = (byte_idx % 4u) * 8u;
+                    const uint packed_byte = (low_bits[uint_idx] >> byte_offset) & 0xFFu;
+                    
+                    // Extract 2-bit quantized value
+                    const int q_low = int((packed_byte >> int(shift)) & 0x3u);
+                    
+                    // Check high bit for sign adjustment
+                    const uint high_uint_idx = lane / 4u;
+                    const uint high_byte_offset = (lane % 4u) * 8u;
+                    const uint high_byte = (high_bits[high_uint_idx] >> high_byte_offset) & 0xFFu;
+                    const bool has_high_bit = (high_byte & high_bit_mask) != 0u;
+                    
+                    // Final quantized value: q_low - (has_high_bit ? 0 : 4)
+                    const int q = has_high_bit ? q_low : q_low - 4;
+                    
+                    // Get scale for this group
+                    const uint scale_idx = group * 2u + lane / 16u;
+                    const int scale = scales[scale_idx];
+                    
+                    // Accumulate
+                    local_sum += d * float(scale) * float(q) * input_vec[elem_idx];
+                }
+            }
+        }
+    }
+    
+    // Parallel reduction within workgroup
+    shared_sum[tid] = local_sum;
+    barrier();
+    
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        barrier();
+    }
+    
+    // Thread 0 writes result
+    if (tid == 0u) {
+        output_vec[row] = shared_sum[0];
+    }
+}

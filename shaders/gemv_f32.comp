@@ -1,0 +1,36 @@
+#version 450
+
+// Basic GEMV kernel: output = weights * input_vec
+// weights: M x N matrix (row-major)
+// input_vec: N-dimensional vector
+// output_vec: M-dimensional vector
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights {
+    float weights[];
+};
+
+layout(set = 0, binding = 1) readonly buffer InputVec {
+    float input_vec[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer OutputVec {
+    float output_vec[];
+};
+
+layout(push_constant) uniform Params {
+    uint M;  // Number of rows (output dimension)
+    uint N;  // Number of columns (input dimension)
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.M) return;
+    
+    float sum = 0.0;
+    for (uint col = 0; col < pc.N; col++) {
+        sum += weights[row * pc.N + col] * input_vec[col];
+    }
+    output_vec[row] = sum;
+}

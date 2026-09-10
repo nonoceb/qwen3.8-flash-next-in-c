@@ -1,0 +1,74 @@
+#version 450
+
+// Tiled GEMM kernel for batch matrix multiplication
+// Used in batch prefill (batch_size=4)
+// C = A * B where A is M x K, B is K x N, C is M x N
+
+#define TILE_SIZE 16
+
+layout(local_size_x = TILE_SIZE, local_size_y = TILE_SIZE) in;
+
+layout(set = 0, binding = 0) readonly buffer MatrixA {
+    float A[];  // M x K matrix (row-major)
+};
+
+layout(set = 0, binding = 1) readonly buffer MatrixB {
+    float B[];  // K x N matrix (row-major)
+};
+
+layout(set = 0, binding = 2) writeonly buffer MatrixC {
+    float C[];  // M x N matrix (row-major)
+};
+
+layout(push_constant) uniform Params {
+    uint M;  // Rows of A and C
+    uint K;  // Columns of A, rows of B
+    uint N;  // Columns of B and C
+} pc;
+
+shared float tile_A[TILE_SIZE][TILE_SIZE];
+shared float tile_B[TILE_SIZE][TILE_SIZE];
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;  // M dimension
+    uint col = gl_GlobalInvocationID.x;  // N dimension
+    
+    if (row >= pc.M || col >= pc.N) return;
+    
+    float sum = 0.0;
+    uint num_tiles = (pc.K + TILE_SIZE - 1u) / TILE_SIZE;
+    
+    for (uint t = 0; t < num_tiles; t++) {
+        uint tiled_row = gl_LocalInvocationID.y;
+        uint tiled_col = gl_LocalInvocationID.x;
+        
+        // Load tile from A
+        uint a_row = row;
+        uint a_col = t * TILE_SIZE + tiled_col;
+        if (a_row < pc.M && a_col < pc.K) {
+            tile_A[tiled_row][tiled_col] = A[a_row * pc.K + a_col];
+        } else {
+            tile_A[tiled_row][tiled_col] = 0.0;
+        }
+        
+        // Load tile from B
+        uint b_row = t * TILE_SIZE + tiled_row;
+        uint b_col = col;
+        if (b_row < pc.K && b_col < pc.N) {
+            tile_B[tiled_row][tiled_col] = B[b_row * pc.N + b_col];
+        } else {
+            tile_B[tiled_row][tiled_col] = 0.0;
+        }
+        
+        barrier();
+        
+        // Compute partial dot product
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            sum += tile_A[tiled_row][k] * tile_B[k][tiled_col];
+        }
+        
+        barrier();
+    }
+    
+    C[row * pc.N + col] = sum;
+}

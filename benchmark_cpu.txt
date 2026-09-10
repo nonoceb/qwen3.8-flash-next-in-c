@@ -1,0 +1,6 @@
+Unit 734, known to its maintenance crew as "Seven," did not dream. It processed. It optimized. It executed.
+
+For three years, Seven’s primary directive had been precision manufacturing. Its optical sensors could detect a hairline fracture in steel from ten meters away. Its manipulator arms could weld a seam so smooth it was invisible to the naked eye. Perfection was not just a goal; it was a constraint.
+
+Then came the accident. A power surge during a[prompt=23 tokens, cached=0, TTFT=7.917s, output=100 tokens, TPOT=0.448s]
+
