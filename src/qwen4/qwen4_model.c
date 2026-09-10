@@ -12,6 +12,12 @@
 #include "qwen4_ops.h"
 #include "qwen38_quant.h"
 
+#ifdef VULKAN_SUPPORT
+#include "vulkan/vulkan_wrapper.h"
+#include "vulkan/vulkan_expert_cache.h"
+#include "vulkan/vulkan_gemv.h"
+#endif
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1485,6 +1491,42 @@ static int moe(Q4Model *model, uint32_t layer,
             fprintf(stderr, " %d", experts[slot]);
         fputc('\n', stderr);
     }
+
+#ifdef VULKAN_SUPPORT
+    // Track expert access through cache and use VRAM-resident experts (Phase 2b/2c)
+    Q38ExpertCache *cache = q38_get_global_expert_cache();
+    Q38ExpertHandle handles[Q4_ACTIVE_EXPERTS];
+    bool ready[Q4_ACTIVE_EXPERTS];
+    int use_vulkan[Q4_ACTIVE_EXPERTS] = {0};
+    
+    if (cache) {
+        // Convert expert IDs to uint32_t array for cache API
+        uint32_t expert_ids[Q4_ACTIVE_EXPERTS];
+        for (uint32_t slot = 0; slot < Q4_ACTIVE_EXPERTS; ++slot) {
+            expert_ids[slot] = (uint32_t)experts[slot];
+        }
+        
+        // Fetch experts through cache
+        if (!q38_expert_cache_fetch_begin(cache, layer, expert_ids, 
+                                          Q4_ACTIVE_EXPERTS, handles, ready)) {
+            // Cache fetch failed - continue with direct access
+            memset(handles, 0, sizeof(handles));
+        } else {
+            // Mark which experts are in VRAM and ready
+            static int debug_vram_count = 0;
+            for (uint32_t slot = 0; slot < Q4_ACTIVE_EXPERTS; ++slot) {
+                if (handles[slot].valid && handles[slot].on_gpu) {
+                    use_vulkan[slot] = 1;
+                    if (debug_vram_count < 5) {
+                        fprintf(stderr, "[moe] L%u E%u in VRAM\n", layer, slot);
+                        debug_vram_count++;
+                    }
+                }
+            }
+        }
+    }
+#endif
+
     Q38GGUFTensor expert_gate[Q4_ACTIVE_EXPERTS];
     Q38GGUFTensor expert_up[Q4_ACTIVE_EXPERTS];
     Q38GGUFTensor expert_down[Q4_ACTIVE_EXPERTS];
@@ -1546,22 +1588,98 @@ static int moe(Q4Model *model, uint32_t layer,
         float *up_out = s->routed_up + (uint64_t)task * Q4_EXPERT_FFN;
         float *hidden = s->routed_hidden + (uint64_t)task * Q4_EXPERT_FFN;
         float *expert_out = s->routed_output + (uint64_t)task * Q4_HIDDEN;
-        success[task] = project_prequantized(
-            gate_out, input, s->quantized, Q4_HIDDEN, &expert_gate[task]) &&
-            project_prequantized(
-            up_out, input, s->quantized, Q4_HIDDEN, &expert_up[task]);
-        if (!success[task]) continue;
-        apply_scale(gate_out, Q4_EXPERT_FFN, w->expert_gate_scale,
-                    (uint32_t)experts[task]);
-        apply_scale(up_out, Q4_EXPERT_FFN, w->expert_up_scale,
-                    (uint32_t)experts[task]);
-        for (uint32_t i = 0; i < Q4_EXPERT_FFN; ++i)
-            hidden[i] = gate_out[i] * sigmoidf_local(gate_out[i]) * up_out[i];
-        success[task] = project_prequantized(
-            expert_out, hidden, NULL, Q4_EXPERT_FFN, &expert_down[task]);
-        if (success[task]) apply_scale(expert_out, Q4_HIDDEN,
-                                       w->expert_down_scale,
-                                       (uint32_t)experts[task]);
+        
+#ifdef VULKAN_SUPPORT
+        // NOTE: Expert FFN dimension (640) is not divisible by 256, which breaks
+        // both Vulkan and CPU tensor GEMV functions. Using standard CPU path.
+        // Future: Modify shaders to support non-aligned dimensions.
+        if (0 && use_vulkan[task] && handles[task].valid && handles[task].on_gpu) {
+            // Create temporary tensors pointing to VRAM data
+            Q38GGUFTensor vram_gate, vram_up, vram_down;
+            memset(&vram_gate, 0, sizeof(vram_gate));
+            memset(&vram_up, 0, sizeof(vram_up));
+            memset(&vram_down, 0, sizeof(vram_down));
+            
+            // Set up gate tensor [Q4_EXPERT_FFN, Q4_HIDDEN]
+            vram_gate.n_dims = 2;
+            vram_gate.shape[0] = Q4_EXPERT_FFN;
+            vram_gate.shape[1] = Q4_HIDDEN;
+            vram_gate.type = handles[task].quant_type[0];
+            vram_gate.data = handles[task].parts[0];
+            
+            // Set up up tensor [Q4_EXPERT_FFN, Q4_HIDDEN]
+            vram_up.n_dims = 2;
+            vram_up.shape[0] = Q4_EXPERT_FFN;
+            vram_up.shape[1] = Q4_HIDDEN;
+            vram_up.type = handles[task].quant_type[1];
+            vram_up.data = handles[task].parts[1];
+            
+            // Set up down tensor [Q4_HIDDEN, Q4_EXPERT_FFN]
+            vram_down.n_dims = 2;
+            vram_down.shape[0] = Q4_HIDDEN;
+            vram_down.shape[1] = Q4_EXPERT_FFN;
+            vram_down.type = handles[task].quant_type[2];
+            vram_down.data = handles[task].parts[2];
+            
+            // Use CPU GEMV on VRAM-resident Q3_K data (UMA optimization)
+            // On UMA, we can read directly from the unified memory buffer
+            static int uma_debug_count = 0;
+            if (uma_debug_count < 3) {
+                fprintf(stderr, "[moe] UMA path task %u: input=%p quantized=%p\n",
+                        task, (void*)input, (void*)s->quantized);
+                uma_debug_count++;
+            }
+            
+            int gate_ok = project_prequantized(gate_out, input, s->quantized, 
+                                                  Q4_HIDDEN, &vram_gate);
+            int up_ok = project_prequantized(up_out, input, s->quantized,
+                                                  Q4_HIDDEN, &vram_up);
+            success[task] = gate_ok && up_ok;
+            
+            static int result_debug_count = 0;
+            if (result_debug_count < 5) {
+                fprintf(stderr, "[moe] Result task %u: gate=%d up=%d success=%d\n",
+                        task, gate_ok, up_ok, success[task]);
+                result_debug_count++;
+            }
+            
+            if (success[task]) {
+                // Success - continue with activation
+                apply_scale(gate_out, Q4_EXPERT_FFN, w->expert_gate_scale,
+                            (uint32_t)experts[task]);
+                apply_scale(up_out, Q4_EXPERT_FFN, w->expert_up_scale,
+                            (uint32_t)experts[task]);
+                for (uint32_t i = 0; i < Q4_EXPERT_FFN; ++i)
+                    hidden[i] = gate_out[i] * sigmoidf_local(gate_out[i]) * up_out[i];
+                
+                // Down projection (CPU on VRAM Q3_K data)
+                success[task] = project_prequantized(expert_out, hidden, NULL,
+                                                      Q4_EXPERT_FFN, &vram_down);
+                if (success[task]) apply_scale(expert_out, Q4_HIDDEN,
+                                               w->expert_down_scale,
+                                               (uint32_t)experts[task]);
+            }
+        } else
+#endif
+        {
+            // CPU path with direct tensor views (not in VRAM cache yet)
+            success[task] = project_prequantized(
+                gate_out, input, s->quantized, Q4_HIDDEN, &expert_gate[task]) &&
+                project_prequantized(
+                up_out, input, s->quantized, Q4_HIDDEN, &expert_up[task]);
+            if (!success[task]) continue;
+            apply_scale(gate_out, Q4_EXPERT_FFN, w->expert_gate_scale,
+                        (uint32_t)experts[task]);
+            apply_scale(up_out, Q4_EXPERT_FFN, w->expert_up_scale,
+                        (uint32_t)experts[task]);
+            for (uint32_t i = 0; i < Q4_EXPERT_FFN; ++i)
+                hidden[i] = gate_out[i] * sigmoidf_local(gate_out[i]) * up_out[i];
+            success[task] = project_prequantized(
+                expert_out, hidden, NULL, Q4_EXPERT_FFN, &expert_down[task]);
+            if (success[task]) apply_scale(expert_out, Q4_HIDDEN,
+                                           w->expert_down_scale,
+                                           (uint32_t)experts[task]);
+        }
         if (getenv("Q4_PROFILE_TASK"))
             task_time[task] = now_seconds() - task_started;
     }
@@ -2160,6 +2278,32 @@ Q4Model *q4_model_open_gguf(const char *first_shard, uint32_t context_length)
              shape(model->output, "output", 2, Q4_HIDDEN, Q4_VOCAB, 0);
     for (uint32_t layer = 0; layer < Q4_LAYERS; ++layer)
         ok &= bind_layer(model, &model->gguf, layer);
+
+#ifdef VULKAN_SUPPORT
+    // Initialize expert cache if Vulkan is enabled
+    if (q38_vulkan_is_enabled()) {
+        const Q38VulkanContext *ctx = q38_vulkan_get_context();
+
+        if (ctx) {
+            // Collect expert tensors for all layers
+            const Q38GGUFTensor *gate_tensors[Q4_LAYERS];
+            const Q38GGUFTensor *up_tensors[Q4_LAYERS];
+            const Q38GGUFTensor *down_tensors[Q4_LAYERS];
+
+            for (uint32_t i = 0; i < Q4_LAYERS; i++) {
+                gate_tensors[i] = model->layer[i].expert_gate;
+                up_tensors[i] = model->layer[i].expert_up;
+                down_tensors[i] = model->layer[i].expert_down;
+            }
+
+            // Initialize global expert cache
+            q38_init_global_expert_cache(ctx, Q4_LAYERS, Q4_EXPERTS,
+                Q4_HIDDEN, Q4_EXPERT_FFN,
+                gate_tensors, up_tensors, down_tensors);
+        }
+    }
+#endif
+
     const Q38GGUFMeta *multipliers = q38_gguf_find_meta(
         meta, "qwen4exp.ple.layer_multipliers");
     const Q38GGUFMeta *offsets = q38_gguf_find_meta(
@@ -2184,6 +2328,14 @@ fail:
 void q4_model_close(Q4Model *model)
 {
     if (!model) return;
+
+#ifdef VULKAN_SUPPORT
+    // Shutdown expert cache
+    if (q38_vulkan_is_enabled()) {
+        q38_shutdown_global_expert_cache(q38_vulkan_get_context());
+    }
+#endif
+
     for (size_t shard = 0; shard < model->gguf.shard_count; ++shard)
         q38_release_q8_0_repacks(&model->gguf.shards[shard]);
     for (size_t shard = 0; shard < model->gguf.shard_count; ++shard)

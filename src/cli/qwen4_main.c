@@ -9,6 +9,10 @@
 #include "qwen38_tokenizer.h"
 #include "qwen38_tool.h"
 
+#ifdef VULKAN_SUPPORT
+#include "vulkan/vulkan_wrapper.h"
+#endif
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -713,6 +717,12 @@ int main(int argc, char **argv)
         return argc > 1 && strcmp(argv[1], "--help") == 0 ? 0 : 2;
     }
     configure_memory_policy(&options);
+
+#ifdef VULKAN_SUPPORT
+    // Initialize Vulkan early so expert cache can be set up during model load
+    q38_vulkan_get_context();
+#endif
+
     Q4Model *model = q4_model_open_gguf(options.model, options.context);
     Q38Tokenizer *tokenizer = q38_tokenizer_open_gguf(options.model);
     if (!model || !tokenizer) {

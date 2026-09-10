@@ -1,0 +1,109 @@
+#version 450
+
+// IQ4_NL quantized GEMV kernel - Optimized for UMA/NVRAM performance
+// Uses padded 20-byte blocks (18 bytes data + 2 bytes padding) for uint-aligned access
+// This ensures coalesced memory reads and optimal cache utilization
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights {
+    uint weights_packed[];  // Padded IQ4_NL blocks (5 uints = 20 bytes per block)
+};
+
+layout(set = 0, binding = 1) readonly buffer InputVec {
+    float input_vec[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer OutputVec {
+    float output_vec[];
+};
+
+layout(set = 0, binding = 3) readonly buffer Codebook {
+    float iq4nl_values[16];
+};
+
+layout(push_constant) uniform Params {
+    uint M;              // Number of rows (output dimension)
+    uint N;              // Number of columns (input dimension)
+    uint blocks_per_row; // Number of blocks per row (N / 32)
+} pc;
+
+// Decode fp16 from 2 bytes (little-endian)
+float decode_fp16(uint b0, uint b1) {
+    uint bits = b0 | (b1 << 8u);
+    uint sign = (bits >> 15u) & 1u;
+    uint exp = (bits >> 10u) & 31u;
+    uint mant = bits & 1023u;
+    
+    if (exp == 0u) return 0.0;  // Denormals/zero
+    
+    float value = (1.0 + float(mant) / 1024.0) * pow(2.0, float(exp) - 15.0);
+    return sign == 1u ? -value : value;
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.M) return;
+    
+    float sum = 0.0;
+    
+    // Each block is 20 bytes (5 uints): 2 bytes scale + 16 bytes weights + 2 bytes padding
+    // This padding ensures uint-aligned access for optimal memory bandwidth
+    const uint UINTS_PER_BLOCK = 5u;
+    uint row_offset = row * pc.blocks_per_row * UINTS_PER_BLOCK;
+    
+    for (uint block = 0; block < pc.blocks_per_row; block++) {
+        uint block_start = row_offset + block * UINTS_PER_BLOCK;
+        
+        // Read all 5 uints for this block (coalesced read)
+        uint u0 = weights_packed[block_start];
+        uint u1 = weights_packed[block_start + 1u];
+        uint u2 = weights_packed[block_start + 2u];
+        uint u3 = weights_packed[block_start + 3u];
+        uint u4 = weights_packed[block_start + 4u];
+        
+        // Extract scale from first 2 bytes of u0
+        float scale = decode_fp16(u0 & 0xFFu, (u0 >> 8u) & 0xFFu);
+        
+        // Unpack 16 weight bytes from u0[2:3], u1, u2, u3, u4[0:1]
+        // Layout: [scale_lo, scale_hi, w0, w1] [w2-w5] [w6-w9] [w10-w13] [w14, w15, pad, pad]
+        uint weights[16];
+        weights[0]  = (u0 >> 16u) & 0xFFu;  // byte 2
+        weights[1]  = (u0 >> 24u) & 0xFFu;  // byte 3
+        weights[2]  = u1 & 0xFFu;          // byte 4
+        weights[3]  = (u1 >> 8u) & 0xFFu;   // byte 5
+        weights[4]  = (u1 >> 16u) & 0xFFu;  // byte 6
+        weights[5]  = (u1 >> 24u) & 0xFFu;  // byte 7
+        weights[6]  = u2 & 0xFFu;          // byte 8
+        weights[7]  = (u2 >> 8u) & 0xFFu;   // byte 9
+        weights[8]  = (u2 >> 16u) & 0xFFu;  // byte 10
+        weights[9]  = (u2 >> 24u) & 0xFFu;  // byte 11
+        weights[10] = u3 & 0xFFu;          // byte 12
+        weights[11] = (u3 >> 8u) & 0xFFu;   // byte 13
+        weights[12] = (u3 >> 16u) & 0xFFu;  // byte 14
+        weights[13] = (u3 >> 24u) & 0xFFu;  // byte 15
+        weights[14] = u4 & 0xFFu;          // byte 16
+        weights[15] = (u4 >> 8u) & 0xFFu;   // byte 17
+        
+        // Process each packed byte (2 values per byte)
+        for (uint i = 0u; i < 16u; i++) {
+            uint packed = weights[i];
+            
+            // Lower nibble (first value)
+            uint col_idx_lo = block * 32u + i * 2u;
+            if (col_idx_lo < pc.N) {
+                float weight_lo = iq4nl_values[packed & 0xFu] * scale;
+                sum += weight_lo * input_vec[col_idx_lo];
+            }
+            
+            // Upper nibble (second value)
+            uint col_idx_hi = block * 32u + i * 2u + 1u;
+            if (col_idx_hi < pc.N) {
+                float weight_hi = iq4nl_values[(packed >> 4u) & 0xFu] * scale;
+                sum += weight_hi * input_vec[col_idx_hi];
+            }
+        }
+    }
+    
+    output_vec[row] = sum;
+}

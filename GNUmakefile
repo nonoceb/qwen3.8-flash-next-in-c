@@ -2,6 +2,16 @@ CC       ?= cc
 BUILD    ?= build
 BIN      ?= bin
 
+# Vulkan support (optional)
+VULKAN_SUPPORT ?= 1
+ifeq ($(VULKAN_SUPPORT),1)
+  VULKAN_CFLAGS ?= $(shell pkg-config --cflags vulkan 2>/dev/null || echo "-I/usr/include/vulkan")
+  VULKAN_LDFLAGS ?= $(shell pkg-config --libs vulkan 2>/dev/null || echo "-lvulkan")
+else
+  VULKAN_CFLAGS :=
+  VULKAN_LDFLAGS :=
+endif
+
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
@@ -21,9 +31,25 @@ else
 endif
 
 WARN := -Wall -Wextra -Wpointer-arith -Wshadow -Wvla
-CFLAGS ?= -O3 -std=c99 $(WARN) $(ARCH) $(OMP_CFLAGS) -ffp-contract=off
-LDFLAGS ?= -lm -pthread $(OMP_LDFLAGS)
+CFLAGS ?= -O3 -std=c99 $(WARN) $(ARCH) $(OMP_CFLAGS) -ffp-contract=off $(VULKAN_CFLAGS)
+LDFLAGS ?= -lm -pthread $(OMP_LDFLAGS) $(VULKAN_LDFLAGS)
 INCLUDES := -Iinclude -Iinclude/qwen38 -Iinclude/qwen4 -Ithird_party -Isrc/io -Isrc/cli
+
+# Add VULKAN_SUPPORT define if enabled
+ifeq ($(VULKAN_SUPPORT),1)
+  CFLAGS += -DVULKAN_SUPPORT
+endif
+
+# Vulkan object files
+VULKAN_OBJ :=
+ifeq ($(VULKAN_SUPPORT),1)
+  VULKAN_OBJ := $(BUILD)/src/vulkan/vulkan_context.o \
+                $(BUILD)/src/vulkan/vulkan_buffers.o \
+                $(BUILD)/src/vulkan/vulkan_gemv.o \
+                $(BUILD)/src/vulkan/vulkan_weight_cache.o \
+                $(BUILD)/src/vulkan/vulkan_expert_cache.o \
+                $(BUILD)/src/vulkan/vulkan_wrapper.o
+endif
 
 GGUF_OBJ := $(BUILD)/src/io/qwen38_gguf.o
 Q4_GGUF_OBJ := $(BUILD)/src/io/qwen4_gguf.o
@@ -70,7 +96,7 @@ $(BIN):
 $(BIN)/test_qwen38_gguf: tests/unit/test_qwen38_gguf.c $(TOKENIZER_OBJ) $(GGUF_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
-$(BIN)/test_qwen38_quant: tests/unit/test_qwen38_quant.c $(QUANT_OBJ) $(GGUF_OBJ) | $(BIN)
+$(BIN)/test_qwen38_quant: tests/unit/test_qwen38_quant.c $(QUANT_OBJ) $(GGUF_OBJ) $(VULKAN_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_qwen38_sampler: tests/unit/test_qwen38_sampler.c $(SAMPLER_OBJ) | $(BIN)
@@ -91,6 +117,22 @@ $(BIN)/test_qwen4_gguf: tests/unit/test_qwen4_gguf.c $(Q4_GGUF_OBJ) $(GGUF_OBJ) 
 
 $(BIN)/test_qwen4_ops: tests/unit/test_qwen4_ops.c $(Q4_OPS_OBJ) $(GGUF_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+# Vulkan test (only built if Vulkan support is enabled)
+ifeq ($(VULKAN_SUPPORT),1)
+TEST_BINS += $(BIN)/test_vulkan
+TEST_BINS += $(BIN)/test_vulkan_gemv
+TEST_BINS += $(BIN)/test_vulkan_iq4nl
+
+$(BIN)/test_vulkan: tests/test_vulkan.c $(VULKAN_OBJ) | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/test_vulkan_gemv: tests/test_vulkan_gemv.c $(VULKAN_OBJ) | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/test_vulkan_iq4nl: tests/test_vulkan_iq4nl.c $(VULKAN_OBJ) | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+endif
 
 $(BIN)/qwen4-meta-inspect: src/cli/qwen4_meta_inspect.c $(GGUF_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
@@ -113,7 +155,7 @@ $(BIN)/qwen4-qsa-probe: src/cli/qwen4_qsa_probe.c $(Q4_MODEL_OBJ) $(Q4_OPS_OBJ) 
 $(BIN)/qwen4-batch-bench: src/cli/qwen4_batch_bench.c $(Q4_MODEL_OBJ) $(Q4_OPS_OBJ) $(QUANT_OBJ) $(Q4_GGUF_OBJ) $(GGUF_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
-$(BIN)/qwen4: src/cli/qwen4_main.c $(Q4_MODEL_OBJ) $(Q4_OPS_OBJ) $(QUANT_OBJ) $(TOKENIZER_OBJ) $(SAMPLER_OBJ) $(Q4_GGUF_OBJ) $(GGUF_OBJ) $(HTTP_OBJ) $(TOOL_OBJ) | $(BIN)
+$(BIN)/qwen4: src/cli/qwen4_main.c $(Q4_MODEL_OBJ) $(Q4_OPS_OBJ) $(QUANT_OBJ) $(TOKENIZER_OBJ) $(SAMPLER_OBJ) $(Q4_GGUF_OBJ) $(GGUF_OBJ) $(HTTP_OBJ) $(TOOL_OBJ) $(VULKAN_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 test: $(TEST_BINS) $(BIN)/qwen4

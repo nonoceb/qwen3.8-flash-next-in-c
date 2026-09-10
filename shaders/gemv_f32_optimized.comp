@@ -1,0 +1,54 @@
+#version 450
+
+// Optimized GEMV kernel with shared memory tiling
+// Loads input_vec vector into shared memory to reduce global memory reads
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights {
+    float weights[];
+};
+
+layout(set = 0, binding = 1) readonly buffer InputVec {
+    float input_vec[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer OutputVec {
+    float output_vec[];
+};
+
+layout(push_constant) uniform Params {
+    uint M;  // Number of rows (output dimension)
+    uint N;  // Number of columns (input dimension)
+} pc;
+
+// Shared memory for input_vec vector tile
+// Process in chunks of 256 elements at a time
+shared float shared_input[256];
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.M) return;
+    
+    float sum = 0.0;
+    uint num_tiles = (pc.N + 255u) / 256u;
+    
+    for (uint tile = 0; tile < num_tiles; tile++) {
+        uint tile_offset = tile * 256u;
+        uint tile_size = min(256u, pc.N - tile_offset);
+        
+        // Cooperatively load input_vec tile into shared memory
+        if (gl_LocalInvocationID.x < tile_size) {
+            shared_input[gl_LocalInvocationID.x] = input_vec[tile_offset + gl_LocalInvocationID.x];
+        }
+        barrier();
+        
+        // Compute partial dot product using shared memory
+        for (uint col = 0; col < tile_size; col++) {
+            sum += weights[row * pc.N + tile_offset + col] * shared_input[col];
+        }
+        barrier();
+    }
+    
+    output_vec[row] = sum;
+}

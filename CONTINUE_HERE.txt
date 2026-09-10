@@ -1,0 +1,40 @@
+================================================================================
+NEXT SESSION START POINT
+================================================================================
+
+READ THIS FIRST: handoff.md (743 lines, comprehensive documentation)
+
+QUICK STATUS:
+-------------
+✅ AVX-512 optimizations COMPLETE - 40% speedup achieved
+🔧 Vulkan GPU foundation READY - IQ4_NL kernel needs debugging
+
+FILES TO READ:
+--------------
+1. handoff.md              - Complete technical documentation (START HERE)
+2. AVX512_OPTIMIZATION.md   - CPU optimization details  
+3. OPTIMIZATION_SUMMARY.md  - Overall project summary
+
+BUILD & TEST:
+-------------
+./test_optimizations.sh    # Verify everything works
+./bin/benchmark_avx512      # See performance gains
+
+NEXT PRIORITIES:
+----------------
+1. Debug Vulkan IQ4_NL kernel (see handoff.md Part 3)
+2. Implement weight caching for GPU
+3. Add async execution
+
+KEY FILES:
+----------
+src/qwen38/qwen38_quant.c  - AVX-512 GEMV kernels (lines 3014-3397)
+src/vulkan/vulkan_gemv.c   - GPU kernels (needs debug)
+shaders/gemv_iq4nl.comp    - IQ4_NL shader (needs debug)
+
+PERFORMANCE:
+------------
+Current: ~7 tokens/sec (AVX-512, up from 5)
+Target:  ~10-12 tokens/sec (with working GPU)
+
+================================================================================
